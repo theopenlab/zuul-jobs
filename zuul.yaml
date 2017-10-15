@@ -167,3 +167,10 @@
       Do additional setup needed for multi-node jobs such as setting up
       overlay networks and setting up known-hosts and ssh keys
     pre-run: playbooks/multinode/pre
+    
+- job:
+    name: simple
+    description: |
+      This is a job to test that ansible jobs will run successfully by
+      just - echo hello world
+    run: playbooks/simple/helloworld
