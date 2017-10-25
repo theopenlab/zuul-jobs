@@ -2,10 +2,26 @@ Have ARA generate html logs if ARA and ARA data are both present.
 
 **Role Variables**
 
+.. zuul:rolevar:: ara_generate_html
+
+   Whether to generate a static ARA HTML report or not.
+   Possible values:
+
+   - ``true`` (always generate a report)
+   - ``false`` (never generate a report)
+   - ``failure`` (only generate a report on failure)
+
+   Defaults to ``true``.
+
 .. zuul:rolevar:: ara_compress_html
 
    Whether to compress the ARA HTML output or not.
    Defaults to ``true``.
+
+.. zuul:rolevar:: ara_save_database
+
+   Whether the ARA sqlite database should be saved as part of the logs.
+   Defaults to ``false``.
 
 .. tip::
    Make sure the web server is configured to set the required mimetypes_ in
