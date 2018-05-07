@@ -52,19 +52,17 @@ try:
 except ImportError:
     import ConfigParser as configparser
 
-try:
-    import pip
-except ImportError:
-    pip = None
-
 import os
 import subprocess
 import tempfile
+import traceback
 
 from ansible.module_utils.basic import AnsibleModule
 
+log = list()
 
-def get_sibling_python_packages(projects):
+
+def get_sibling_python_packages(projects, tox_python):
     '''Finds all python packages that zuul has cloned.
 
     If someone does a require_project: and then runs a tox job, it can be
@@ -74,24 +72,40 @@ def get_sibling_python_packages(projects):
 
     for project in projects:
         root = project['src_dir']
+        package_name = None
         setup_cfg = os.path.join(root, 'setup.cfg')
+        found_python = False
         if os.path.exists(setup_cfg):
+            found_python = True
             c = configparser.ConfigParser()
             c.read(setup_cfg)
             package_name = c.get('metadata', 'name')
             packages[package_name] = root
+        if not package_name and os.path.exists(os.path.join(root, 'setup.py')):
+            found_python = True
+            # It's a python package but doesn't use pbr, so we need to run
+            # python setup.py --name to get setup.py to tell us what the
+            # package name is.
+            package_name = subprocess.check_output(
+                [os.path.abspath(tox_python), 'setup.py', '--name'],
+                cwd=os.path.abspath(root), stderr=subprocess.STDOUT)
+            if package_name:
+                package_name = package_name.strip()
+                packages[package_name] = root
+        if found_python and not package_name:
+            log.append(
+                "Could not find package name for {root}".format(
+                    root=root))
     return packages
 
 
 def get_installed_packages(tox_python):
-    if pip is None:
-        raise RuntimeError("pip python module is required")
-    with tempfile.NamedTemporaryFile(delete=False) as tmp_requirements:
-        tmp_requirements.write(subprocess.check_output(
-            [tox_python, '-m', 'pip', 'freeze']))
-        tmp_requirements.file.flush()
-        return pip.req.req_file.parse_requirements(
-            tmp_requirements.name, session=pip.download.PipSession())
+    # We use the output of pip freeze here as that is pip's stable public
+    # interface.
+    frozen_pkgs = subprocess.check_output(
+        [tox_python, '-m', 'pip', '-qqq', 'freeze']
+    )
+    return [x.split('==')[0] for x in frozen_pkgs.split('\n') if '==' in x]
 
 
 def write_new_constraints_file(constraints, packages):
@@ -148,7 +162,6 @@ def main():
     log_file = '{log_dir}/{envlist}-siblings.txt'.format(
         log_dir=log_dir, envlist=envlist)
 
-    log = list()
     log.append(
         "Processing siblings for {name} from {project_dir}".format(
             name=package_name,
@@ -156,53 +169,74 @@ def main():
 
     changed = False
 
-    sibling_python_packages = get_sibling_python_packages(projects)
-    for name, root in sibling_python_packages.items():
-        log.append("Sibling {name} at {root}".format(name=name, root=root))
-    found_sibling_packages = []
-    for package in get_installed_packages(tox_python):
-        log.append(
-            "Found {name} python package installed".format(name=package.name))
-        if package.name == package_name:
-            # We don't need to re-process ourself. We've filtered ourselves
-            # from the source dir list, but let's be sure nothing is weird.
+    try:
+        sibling_python_packages = get_sibling_python_packages(
+            projects, tox_python)
+        for name, root in sibling_python_packages.items():
+            log.append("Sibling {name} at {root}".format(name=name, root=root))
+        found_sibling_packages = []
+        for dep_name in get_installed_packages(tox_python):
             log.append(
-                "Skipping {name} because it's us".format(name=package.name))
-            continue
-        if package.name in sibling_python_packages:
-            log.append(
-                "Package {name} on system in {root}".format(
-                    name=package.name,
-                    root=sibling_python_packages[package.name]))
-            changed = True
+                "Found {name} python package installed".format(
+                    name=dep_name))
+            if dep_name == package_name:
+                # We don't need to re-process ourself. We've filtered ourselves
+                # from the source dir list, but let's be sure nothing is weird.
+                log.append(
+                    "Skipping {name} because it's us".format(
+                        name=dep_name))
+                continue
+            if dep_name in sibling_python_packages:
+                log.append(
+                    "Package {name} on system in {root}".format(
+                        name=dep_name,
+                        root=sibling_python_packages[dep_name]))
+                changed = True
 
-            log.append("Uninstalling {name}".format(name=package.name))
+                found_sibling_packages.append(dep_name)
+
+        if constraints:
+            constraints_file = write_new_constraints_file(
+                constraints, found_sibling_packages)
+
+        for sibling_package in found_sibling_packages:
+            log.append("Uninstalling {name}".format(name=sibling_package))
             uninstall_output = subprocess.check_output(
-                [tox_python, '-m', 'pip', 'uninstall', '-y', package.name],
+                [tox_python, '-m',
+                 'pip', 'uninstall', '-y', sibling_package],
                 stderr=subprocess.STDOUT)
             log.extend(uninstall_output.decode('utf-8').split('\n'))
-            found_sibling_packages.append(package.name)
 
-    args = [tox_python, '-m', 'pip', 'install']
+            args = [tox_python, '-m', 'pip', 'install']
+            if constraints:
+                args.extend(['-c', constraints_file])
+            log.append(
+                "Installing {name} from {root} for deps".format(
+                    name=sibling_package,
+                    root=sibling_python_packages[sibling_package]))
+            args.append(sibling_python_packages[sibling_package])
 
-    if constraints:
-        constraints_file = write_new_constraints_file(
-            constraints, found_sibling_packages)
-        args.extend(['-c', constraints_file])
+            install_output = subprocess.check_output(args)
+            log.extend(install_output.decode('utf-8').split('\n'))
 
-    for sibling_package in found_sibling_packages:
-        log.append(
-            "Installing {name} from {root}".format(
-                name=sibling_package,
-                root=sibling_python_packages[sibling_package]))
-        args.append('-e')
-        args.append(sibling_python_packages[sibling_package])
+        for sibling_package in found_sibling_packages:
+            log.append(
+                "Installing {name} from {root}".format(
+                    name=sibling_package,
+                    root=sibling_python_packages[sibling_package]))
 
-    install_output = subprocess.check_output(args)
-    log.extend(install_output.decode('utf-8').split('\n'))
-
-    log_text = "\n".join(log)
-    module.append_to_file(log_file, log_text)
+            install_output = subprocess.check_output(
+                [tox_python, '-m', 'pip', 'install', '--no-deps',
+                 sibling_python_packages[sibling_package]])
+            log.extend(install_output.decode('utf-8').split('\n'))
+    except Exception as e:
+        tb = traceback.format_exc()
+        log.append(str(e))
+        log.append(tb)
+        module.fail_json(msg=str(e), log="\n".join(log))
+    finally:
+        log_text = "\n".join(log)
+        module.append_to_file(log_file, log_text)
     module.exit_json(changed=changed, msg=log_text)
 
 
