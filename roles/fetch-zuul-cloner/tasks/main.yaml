@@ -16,10 +16,7 @@
     mode: 0755
   become: yes
 
+# workaround of the ansible bug: https://github.com/ansible/ansible/issues/50638
 - name: Make repositories writable so that people can hardlink
-  file:
-    path: "{{ ansible_user_dir }}/src"
-    state: directory
-    recurse: yes
-    mode: ugo+rw
+  shell: chmod ugo+rw "{{ ansible_user_dir }}/src" -R
   become: yes
